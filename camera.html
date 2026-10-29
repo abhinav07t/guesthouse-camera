@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Capture Attendance Photo</title>
+  <!--
+    This page is deployed to an ordinary HTTPS static host (GitHub Pages,
+    Cloudflare Pages, etc.) OUTSIDE the Google Apps Script HtmlService
+    sandbox, specifically so getUserMedia() can request camera access.
+    It is opened in a new window/tab by the attendance app, captures one
+    photo, and sends it back via window.postMessage to the exact origin
+    that opened it. It never talks to any backend, spreadsheet, or Drive
+    folder directly, and holds no secrets of any kind.
+    See CAMERA_DEPLOYMENT.md for hosting instructions.
+  -->
+  <style>
+    :root{
+      --bg:#f4f6f8; --surface:#ffffff; --text:#1f2a33; --muted:#5b6b77;
+      --primary:#2c5f6e; --primary-dark:#1d4652; --accent:#3a8a7a;
+      --danger:#b3432f; --danger-bg:#fbe9e6; --success:#1f7a4d; --success-bg:#e6f4ec;
+      --warn:#9a6b17; --warn-bg:#fdf3dd; --border:#e1e6ea;
+    }
+    @media (prefers-color-scheme: dark){
+      :root{
+        --bg:#14191d; --surface:#1d2429; --text:#e8edf0; --muted:#9fb0ba;
+        --primary:#4a93a6; --primary-dark:#3a7686; --accent:#52ab97;
+        --danger:#e07a63; --danger-bg:#3a2420; --success:#5fcf96; --success-bg:#1c3326;
+        --warn:#e3b35b; --warn-bg:#352c16; --border:#2b343a;
+      }
+    }
+    *{box-sizing:border-box;}
+    html,body{height:100%;}
+    body{
+      margin:0; background:var(--bg); color:var(--text);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+    }
+    .topbar{ background:var(--primary); color:#fff; padding:16px 18px; padding-top:calc(16px + env(safe-area-inset-top,0px)); }
+    .topbar h1{ font-size:17px; margin:0; font-weight:600; }
+    .wrap{ max-width:480px; margin:0 auto; padding:16px; }
+    .card{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:16px; }
+    video, canvas, img.preview{ width:100%; border-radius:10px; background:#000; display:block; }
+    .hidden{ display:none !important; }
+    .btn{ display:block; width:100%; padding:14px; border:none; border-radius:10px; font-size:16px; font-weight:700; cursor:pointer; margin-top:10px; text-align:center; }
+    .btn-primary{ background:var(--primary); color:#fff; }
+    .btn-accent{ background:var(--accent); color:#fff; }
+    .btn-secondary{ background:var(--bg); color:var(--text); border:1px solid var(--border); }
+    .msg{ padding:12px 14px; border-radius:8px; font-size:14px; margin-bottom:14px; display:none; }
+    .msg.error{ display:block; background:var(--danger-bg); color:var(--danger); }
+    .msg.success{ display:block; background:var(--success-bg); color:var(--success); }
+    .msg.info{ display:block; background:var(--warn-bg); color:var(--warn); }
+    .small{ font-size:12px; color:var(--muted); margin-top:14px; }
+  </style>
+</head>
+<body>
+  <div class="topbar"><h1>&#128247; Capture Live Photo</h1></div>
+  <div class="wrap">
+    <div class="card">
+      <div id="msg" class="msg"></div>
+      <video id="video" autoplay playsinline muted class="hidden"></video>
+      <canvas id="canvas" class="hidden"></canvas>
+      <img id="preview" class="preview hidden">
+
+      <button type="button" class="btn btn-primary hidden" id="btnCapture">Capture Photo</button>
+      <button type="button" class="btn btn-secondary hidden" id="btnRetake">Retake</button>
+      <button type="button" class="btn btn-accent hidden" id="btnUse">Use This Photo</button>
+      <button type="button" class="btn btn-secondary" id="btnCancel">Cancel</button>
+
+      <p class="small">This photo is sent back only to the attendance app that opened this page. A photo alone does not confirm the holder's identity.</p>
+    </div>
+  </div>
+
+  <script>
+    var params = new URLSearchParams(window.location.search);
+    var nonce = params.get('nonce');
+    var returnOrigin = params.get('returnOrigin');
+    var maxBytes = Number(params.get('maxBytes')) || 2000000;
+    var stream = null;
+    var sentPhoto = false;
+
+    function isValidReturnOrigin(o) {
+      if (!o) return false;
+      try {
+        var u = new URL(o);
+        return u.protocol === 'https:' || (u.protocol === 'http:' && u.hostname === 'localhost');
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function showMsg(type, text) {
+      var el = document.getElementById('msg');
+      el.className = 'msg ' + type;
+      el.textContent = text;
+      el.style.display = 'block';
+    }
+
+    function show(id) { document.getElementById(id).classList.remove('hidden'); }
+    function hide(id) { document.getElementById(id).classList.add('hidden'); }
+
+    function sendToOpener(message) {
+      if (!window.opener || !isValidReturnOrigin(returnOrigin)) return false;
+      try {
+        window.opener.postMessage(message, returnOrigin);
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function sendError(message) {
+      if (!nonce) return;
+      sendToOpener({ type: 'CAMERA_ERROR', nonce: nonce, message: message });
+    }
+
+    function stopStream() {
+      if (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        stream = null;
+      }
+    }
+
+    function startCamera() {
+      showMsg('info', 'Requesting camera access...');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showMsg('error', 'This browser does not support camera capture.');
+        sendError('Browser does not support camera capture (getUserMedia unavailable).');
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+        .then(function (s) {
+          stream = s;
+          var video = document.getElementById('video');
+          video.srcObject = s;
+          show('video');
+          show('btnCapture');
+          document.getElementById('msg').style.display = 'none';
+        })
+        .catch(function (err) {
+          var reason = (err && err.message) ? err.message : String(err);
+          showMsg('error', 'Camera unavailable or permission denied: ' + reason + '. Allow camera access in your browser/site settings and reload this tab.');
+          sendError('Camera permission denied or unavailable: ' + reason);
+        });
+    }
+
+    function capture() {
+      var video = document.getElementById('video');
+      var canvas = document.getElementById('canvas');
+      if (!video.videoWidth) {
+        showMsg('error', 'Camera feed is not ready yet. Please wait a moment and try again.');
+        return;
+      }
+      var maxWidth = 800;
+      var scale = Math.min(1, maxWidth / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      var dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+      var preview = document.getElementById('preview');
+      preview.src = dataUrl;
+      show('preview');
+      hide('video');
+      stopStream();
+
+      hide('btnCapture');
+      show('btnRetake');
+      show('btnUse');
+    }
+
+    function retake() {
+      hide('preview');
+      hide('btnRetake');
+      hide('btnUse');
+      document.getElementById('msg').style.display = 'none';
+      startCamera();
+    }
+
+    function usePhoto() {
+      var dataUrl = document.getElementById('preview').src;
+      var parts = dataUrl.split(',');
+      var base64 = parts.length > 1 ? parts[1] : '';
+      if (!base64) {
+        showMsg('error', 'No captured photo to send. Please capture a photo first.');
+        return;
+      }
+      var approxBytes = Math.floor(base64.length * 0.75);
+      if (approxBytes > maxBytes) {
+        showMsg('error', 'Photo is too large (' + Math.round(approxBytes / 1024) + 'KB, max ' + Math.round(maxBytes / 1024) + 'KB). Please retake.');
+        return;
+      }
+
+      var ok = sendToOpener({ type: 'CAMERA_PHOTO_CAPTURED', nonce: nonce, mime: 'image/jpeg', base64: base64 });
+      if (!ok) {
+        showMsg('error', 'Could not send the photo back to the attendance app. Please close this tab and try again from the app.');
+        return;
+      }
+      sentPhoto = true;
+      showMsg('success', 'Photo sent back to the attendance app. You can close this tab.');
+      hide('btnUse');
+      hide('btnRetake');
+      setTimeout(function () { try { window.close(); } catch (e) { /* ignore */ } }, 900);
+    }
+
+    function cancel() {
+      stopStream();
+      try { window.close(); } catch (e) { /* ignore */ }
+    }
+
+    window.addEventListener('load', function () {
+      document.getElementById('btnCapture').addEventListener('click', capture);
+      document.getElementById('btnRetake').addEventListener('click', retake);
+      document.getElementById('btnUse').addEventListener('click', usePhoto);
+      document.getElementById('btnCancel').addEventListener('click', cancel);
+
+      if (!window.opener || !nonce || !isValidReturnOrigin(returnOrigin)) {
+        showMsg('error', 'This page must be opened from the attendance app with a valid session. You can close this tab.');
+        return;
+      }
+
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+        showMsg('error', 'This page must be served over HTTPS for camera access to work.');
+        sendError('Camera page was not served over HTTPS.');
+        return;
+      }
+
+      startCamera();
+    });
+
+    window.addEventListener('beforeunload', function () {
+      stopStream();
+      if (!sentPhoto) sendError('Camera tab was closed before a photo was captured.');
+    });
+  </script>
+</body>
+</html>
